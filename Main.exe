@@ -1,0 +1,146 @@
+// ip_scanner.cpp
+// Simple POSIX-based IP "search" (attempt TCP connect with timeout).
+// Compile: g++ -std=c++17 ip_scanner.cpp -o ip_scanner
+// Usage:
+//   ./ip_scanner -p 80 192.168.1.1 8.8.8.8
+//   ./ip_scanner -p 22 -f targets.txt
+
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <regex>
+#include <string>
+#include <vector>
+
+bool is_valid_ipv4(const std::string &ip) {
+    std::regex v4("^(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\."
+                  "(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\."
+                  "(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\."
+                  "(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$");
+    return std::regex_match(ip, v4);
+}
+
+std::vector<std::string> read_ips_from_file(const std::string &path) {
+    std::vector<std::string> ips;
+    std::ifstream f(path);
+    if (!f) return ips;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        // trim spaces
+        size_t s = line.find_first_not_of(" \t\r\n");
+        size_t e = line.find_last_not_of(" \t\r\n");
+        if (s==std::string::npos) continue;
+        ips.push_back(line.substr(s, e - s + 1));
+    }
+    return ips;
+}
+
+// Try to connect to ip:port with timeout_ms milliseconds.
+// Returns true if connect succeeded (remote accepted or connection established).
+bool try_connect(const std::string &ip, uint16_t port, int timeout_ms) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return false;
+
+    // Set non-blocking
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+        close(sock);
+        return false;
+    }
+
+    int res = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    if (res == 0) {
+        // immediate connection (rare for localhost)
+        close(sock);
+        return true;
+    }
+
+    if (errno != EINPROGRESS) {
+        close(sock);
+        return false;
+    }
+
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(sock, &wfds);
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+    res = select(sock + 1, nullptr, &wfds, nullptr, &tv);
+    if (res > 0) {
+        // check for socket error
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0) {
+            close(sock);
+            return false;
+        }
+        close(sock);
+        return (so_error == 0);
+    } else {
+        // timeout or select error
+        close(sock);
+        return false;
+    }
+}
+
+void print_usage() {
+    std::cout << "Usage: ip_scanner [-p port] [-t timeout_ms] [-f file] [ip1 ip2 ...]\n"
+              << "Defaults: port=80 timeout_ms=300\n"
+              << "Example: ./ip_scanner -p 22 192.168.1.1 192.168.1.2\n";
+}
+
+int main(int argc, char **argv) {
+    uint16_t port = 80;
+    int timeout_ms = 300;
+    std::vector<std::string> ips;
+    std::string file;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "-p" && i + 1 < argc) { port = (uint16_t)std::stoi(argv[++i]); }
+        else if (a == "-t" && i + 1 < argc) { timeout_ms = std::stoi(argv[++i]); }
+        else if (a == "-f" && i + 1 < argc) { file = argv[++i]; }
+        else if (a == "-h" || a == "--help") { print_usage(); return 0; }
+        else ips.push_back(a);
+    }
+
+    if (!file.empty()) {
+        auto from_file = read_ips_from_file(file);
+        ips.insert(ips.end(), from_file.begin(), from_file.end());
+    }
+
+    if (ips.empty()) {
+        std::cerr << "No IPs provided.\n";
+        print_usage();
+        return 1;
+    }
+
+    // Validate and run
+    for (const auto &ip : ips) {
+        if (!is_valid_ipv4(ip)) {
+            std::cout << ip << " : invalid IPv4 address\n";
+            continue;
+        }
+        bool ok = try_connect(ip, port, timeout_ms);
+        std::cout << ip << " : " << (ok ? "open/responding" : "no response") << "\n";
+    }
+
+    return 0;
+}
